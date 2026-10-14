@@ -1,0 +1,239 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Servo.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// --- Pin Definitions ---
+const int trigPin = 9;
+const int echoPin = 10;
+const int servo1Pin = 3;  // SG90 Radar Scanner
+const int servo2Pin = 5;  // MG90S Dummy Cannon
+const int buzzerPin = 6;  // MH-FMD Buzzer
+const int mosfetPin = 7;  // IRF520 Spotlight
+
+Servo servo1;
+Servo servo2;
+
+// --- Radar Variables ---
+int scanAngle = 90;       // Start from center
+int scanDirection = 1; 
+const int scanStep = 2; 
+
+// --- Target Variables ---
+int targetAngle = 90;
+int targetDistance = 999;
+bool targetFound = false;
+
+// --- Timing Variables ---
+unsigned long lastBuzzerTime = 0;
+unsigned long lastSpotlightTime = 0;
+bool spotlightActive = false;
+bool buzzerState = false;
+
+// --- Smooth Servo 2 Variables ---
+int servo2CurrentAngle = 90;
+int servo2TargetAngle = 90;
+unsigned long lastServoStepTime = 0;
+const int servoStepDelay = 30; 
+
+bool servo2Moving = false;
+bool returningHome = false;
+bool scannerReturning = false;   // NEW: Scanner wapas 90° par lane ke liye
+
+void setup() {
+  Serial.begin(9600);
+  
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(mosfetPin, OUTPUT);
+
+  servo1.attach(servo1Pin);
+  servo2.attach(servo2Pin);
+  
+  servo1.write(90);              // Scanner center par
+  servo2.write(servo2CurrentAngle);
+  digitalWrite(mosfetPin, LOW);
+  digitalWrite(buzzerPin, HIGH);
+
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+    Serial.println("OLED Failed");
+    for(;;); 
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("RADAR SYSTEM");
+  display.println("SCANNING...");
+  display.display();
+  
+  delay(1000); 
+}
+
+
+ void loop() {
+  // --- STEP 1: SCAN ONLY WHEN FREE ---
+  if (!targetFound && !servo2Moving && !spotlightActive && !returningHome && !scannerReturning) {
+    servo1.write(scanAngle);
+    scanAngle += (scanStep * scanDirection);
+    if (scanAngle >= 180 || scanAngle <= 0) {
+      scanDirection *= -1; 
+    }
+
+    int currentDistance = getDistance();
+    
+    if (currentDistance > 0 && currentDistance < 100) {
+      targetDistance = currentDistance;
+      targetAngle = scanAngle;
+      targetFound = true;
+      updateOLED(targetAngle, targetDistance);
+      
+      servo2TargetAngle = targetAngle;
+      servo2Moving = true;
+      lastServoStepTime = millis();
+    } else {
+      updateOLED(-1, -1);
+    }
+  }
+  // --- STEP 2: SMOOTH SERVO 2 MOVEMENT (to target) ---
+  if (servo2Moving) {
+    if (millis() - lastServoStepTime >= servoStepDelay) {
+      lastServoStepTime = millis();
+      if (servo2CurrentAngle < servo2TargetAngle) servo2CurrentAngle++;
+      else if (servo2CurrentAngle > servo2TargetAngle) servo2CurrentAngle--;
+      servo2.write(servo2CurrentAngle);
+    }
+    
+    if (servo2CurrentAngle == servo2TargetAngle) {
+      servo2Moving = false;
+      digitalWrite(mosfetPin, HIGH);
+      spotlightActive = true;
+      lastSpotlightTime = millis();
+    }
+  }
+
+  // --- STEP 3: SPOTLIGHT ON FOR 2 SECONDS ---
+  if (spotlightActive && (millis() - lastSpotlightTime >= 2000)) {
+    digitalWrite(mosfetPin, LOW);
+    digitalWrite(buzzerPin, HIGH);
+    spotlightActive = false;
+    
+    returningHome = true;
+    servo2TargetAngle = 90;
+    lastServoStepTime = millis();
+  }
+
+  // --- STEP 4: SMOOTH RETURN CANNON TO 90° ---
+  if (returningHome) {
+    if (millis() - lastServoStepTime >= servoStepDelay) {
+      lastServoStepTime = millis();
+      if (servo2CurrentAngle > 90) servo2CurrentAngle--;
+      else if (servo2CurrentAngle < 90) servo2CurrentAngle++;
+      servo2.write(servo2CurrentAngle);
+    }
+    
+    if (servo2CurrentAngle == 90) {
+      returningHome = false;
+      // Now bring scanner back to 90°
+      scannerReturning = true;
+      lastServoStepTime = millis();
+    }
+  }
+
+  // --- STEP 5: SMOOTH RETURN SCANNER TO 90° --- (NEW)
+  if (scannerReturning) {
+    if (millis() - lastServoStepTime >= servoStepDelay) {
+      lastServoStepTime = millis();
+      if (scanAngle > 90) scanAngle--;
+      else if (scanAngle < 90) scanAngle++;
+      servo1.write(scanAngle);
+    }
+    
+    if (scanAngle == 90) {
+      scannerReturning = false;
+      targetFound = false;
+      scanDirection = 1;  // Ready to scan again
+      updateOLED(-1, -1);
+    }
+  }
+
+  // --- STEP 6: BUZZER ---
+  if (targetFound && (servo2Moving || spotlightActive)) {
+    handleBuzzer(targetDistance, true);
+  } else {
+    digitalWrite(buzzerPin, HIGH);
+  }
+
+  delay(20);
+}
+
+// --- Read HC-SR04 Distance ---
+int getDistance() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  
+  long duration = pulseIn(echoPin, HIGH, 20000); 
+  int distance = duration * 0.034 / 2;
+  
+  if (distance == 0) return 999; 
+  return distance;
+}
+
+// --- Update OLED ---
+void updateOLED(int angle, int dist) {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  
+  if (angle == -1) {
+    display.println("RADAR SYSTEM");
+    display.println("SCANNING...");
+  } else {
+    display.println("TARGET FOUND");
+    display.print("Angle: ");
+    display.print(angle);
+    display.println(" deg");
+    display.print("Dist : ");
+    display.print(dist);
+    display.println(" cm");
+    
+    if (dist < 20) {
+      display.println("WARNING!");
+    }
+  }
+  display.display();
+}
+
+// --- Buzzer Logic (Low-Level Trigger) ---
+void handleBuzzer(int dist, bool found) {
+  if (!found || dist > 100) {
+    digitalWrite(buzzerPin, HIGH);
+    return;
+  }
+
+  unsigned long currentMillis = millis();
+  unsigned long interval = 0;
+
+  if (dist > 50) {
+    interval = 1000;
+  } else if (dist > 20) {
+    interval = 300;
+  } else {
+    digitalWrite(buzzerPin, LOW);
+    return;
+  }
+
+  if (currentMillis - lastBuzzerTime >= interval) {
+    lastBuzzerTime = currentMillis;
+    buzzerState = !buzzerState;
+    digitalWrite(buzzerPin, buzzerState ? LOW : HIGH); 
+  }
+}
